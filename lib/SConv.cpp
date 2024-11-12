@@ -182,11 +182,8 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   if (!convOp)  
     return emitSilenceableError() << "expected a Conv2DNchwFchwOp for transformation";
 
+  rewriter.setInsertionPoint(convOp);
   Location loc = convOp.getLoc();
-
-#ifndef NDEBUG
-  DBGS() << "ConvOp: " << convOp << "\n";
-#endif // NDEBUG
 
   SmallVector<Value> inputs = convOp.getDpsInputs();
   ValueRange outputs = convOp.getDpsInits();
@@ -232,7 +229,7 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   // Create the affine maps, iterator types and output tensor shape
   auto parallel = utils::IteratorType::parallel;
   auto reduction = utils::IteratorType::reduction;
-  SmallVector<utils::IteratorType> newOpIterators = {parallel, parallel, parallel, parallel, reduction, reduction};
+  SmallVector<utils::IteratorType> newOpIterators = {parallel, parallel, parallel, reduction, reduction, reduction};
 
   // Get strides
   auto hstride = convOp.getStrides().getValues<int64_t>()[0];
@@ -240,7 +237,8 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
 
   AffineExpr d0, d1, d2, d3, d4, d5;
   bindDims(context, d0, d1, d2, d3, d4, d5);
-  auto lhsMap = AffineMap::get(6, 0, {d0, d3, d2.floorDiv(oh) * hstride + d4, d2 % oh * wstride + d5}, context);
+  // auto lhsMap = AffineMap::get(6, 0, {d0, d3, d2.floorDiv(oh) * hstride + d4, d2 % oh * wstride + d5}, context);
+  auto lhsMap = AffineMap::get(6, 0, {d0, d3, d2.floorDiv(oh) + d4, d2 % oh + d5}, context);
   auto rhsMap = AffineMap::get(6, 0, {d1, d3, d4, d5}, context);
   auto resultMap = AffineMap::get(6, 0, {d0, d1, d2}, context);
 
