@@ -142,7 +142,7 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   tilingOptions.setLoopType(scf::SCFTilingOptions::LoopType::ForOp);
 
 #ifndef NDEBUG
-  DBGS() << "Target before tiling: " << tilingInterfaceOp << "\n";
+  DBGS() << "Outer Conv before tiling: " << tilingInterfaceOp << "\n";
 #endif // NDEBUG
 
   rewriter.setInsertionPoint(target);
@@ -154,8 +154,37 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   // Perform the replacement of tiled and fused values.
   rewriter.replaceOp(tilingInterfaceOp, tiledResults->replacements);
 
+  // Perform the tiling in the inner convolution
+  auto innerOp = tiledResults->tiledOps.front();
+
+  SmallVector<int64_t, 6> innerTileSize = {0, 8, 16, 0, 0, 0};
+  SmallVector<OpFoldResult> innerTileSizesOfr =
+      getAsIndexOpFoldResult(rewriter.getContext(), innerTileSize);
+  SmallVector<int64_t, 2> innerInterchange = {1, 0};
+
+  auto innerTilingInterfaceOp = dyn_cast<TilingInterface>(innerOp);
+  if (!innerTilingInterfaceOp)
+    return transformOp->emitError("only TilingInterface ops are supported");
+  scf::SCFTilingOptions innerTilingOptions;
+  innerTilingOptions.setTileSizes(innerTileSizesOfr).setInterchange(innerInterchange);
+  innerTilingOptions.setLoopType(scf::SCFTilingOptions::LoopType::ForOp);
+
+#ifndef NDEBUG
+  DBGS() << "Inner Conv before tiling: " << innerTilingInterfaceOp << "\n";
+#endif // NDEBUG
+
+  rewriter.setInsertionPoint(innerOp);
+  FailureOr<scf::SCFTilingResult> innerTiledResults =
+      scf::tileUsingSCF(rewriter, innerTilingInterfaceOp, innerTilingOptions);
+  if (failed(innerTiledResults))
+    return failure();
+
+  // Perform the replacement of tiled and fused values.
+  rewriter.replaceOp(innerTilingInterfaceOp, innerTiledResults->replacements);
   // Report back the relevant handles to the transform op.
-  tiledOps.push_back(tiledResults->tiledOps.front());
+  tiledOps.push_back(innerTiledResults->tiledOps.front());
+  for (Operation *loop : innerTiledResults->loops)
+    loopOps.push_back(loop);
   for (Operation *loop : tiledResults->loops)
     loopOps.push_back(loop);
 
@@ -237,8 +266,7 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
 
   AffineExpr d0, d1, d2, d3, d4, d5;
   bindDims(context, d0, d1, d2, d3, d4, d5);
-  // auto lhsMap = AffineMap::get(6, 0, {d0, d3, d2.floorDiv(oh) * hstride + d4, d2 % oh * wstride + d5}, context);
-  auto lhsMap = AffineMap::get(6, 0, {d0, d3, d2.floorDiv(oh) + d4, d2 % oh + d5}, context);
+  auto lhsMap = AffineMap::get(6, 0, {d0, d3, d2.floorDiv(oh) * hstride + d4, d2 % oh * wstride + d5}, context);
   auto rhsMap = AffineMap::get(6, 0, {d1, d3, d4, d5}, context);
   auto resultMap = AffineMap::get(6, 0, {d0, d1, d2}, context);
 
