@@ -11,7 +11,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "SConv.h"
-
+#include "CSA.h"
+#include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Dialect/Index/IR/IndexDialect.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Transform/IR/TransformOps.h"
@@ -26,24 +27,29 @@
 #include "mlir/Dialect/Linalg/TransformOps/Syntax.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Support/LLVM.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Debug.h"
+#include <cstdint>
 
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/Interfaces/CallInterfaces.h"
 
 using namespace mlir;
+using namespace mlir::affine;
 using namespace mlir::linalg;
 using namespace mlir::transform;
 
@@ -124,11 +130,131 @@ static Value createMul(Location loc, Value x, Value y, Type accType,
   return builder.create<arith::MulFOp>(loc, xConvert, yConvert);
 }
 
+// Swap the inner loops when schedule is Input Stationary
+static LogicalResult
+swapInductionVars(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
+                  SmallVector<Operation *> tiledOps, SmallVector<Operation *> &loopOps) {
+
+  if (res.schd != IS) return success();
+
+  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[0]);
+  auto innerLoop = dyn_cast<scf::ForOp>(loopOps[1]);
+  if (!outerLoop || !innerLoop)
+    return transformOp->emitError("Loops must be scf.for");
+
+  // Create the new outerLoop with innerLoop args, except InitArgs
+  rewriter.setInsertionPoint(outerLoop);
+  auto newOuterLoop = rewriter.create<scf::ForOp>(
+      outerLoop.getLoc(), innerLoop.getLowerBound(), innerLoop.getUpperBound(),
+      innerLoop.getStep(), outerLoop.getInitArgs());
+
+  // Create the new innerLoop with outerLoop args, except InitArgs
+  rewriter.setInsertionPointToStart(newOuterLoop.getBody());
+  auto newInnerLoop = rewriter.create<scf::ForOp>(
+      innerLoop.getLoc(), outerLoop.getLowerBound(), outerLoop.getUpperBound(),
+      outerLoop.getStep(), newOuterLoop.getRegionIterArgs());
+
+  // Create mappings for swapping induction variables
+  IRMapping mapping;
+  mapping.map(outerLoop.getInductionVar(), newInnerLoop.getInductionVar());
+  mapping.map(innerLoop.getInductionVar(), newOuterLoop.getInductionVar());
+
+  // Map the iterative arguments of the innerLoop and outerLoop
+    for (auto [oldArg, newArg] : llvm::zip(outerLoop.getRegionIterArgs(), newOuterLoop.getRegionIterArgs())) {
+    mapping.map(oldArg, newArg);
+  }
+  for (auto [oldArg, newArg] : llvm::zip(innerLoop.getRegionIterArgs(), newInnerLoop.getRegionIterArgs())) {
+    mapping.map(oldArg, newArg);
+  }
+
+  // Clone the inner loop's body into the new innerLoop
+  rewriter.setInsertionPointToStart(newInnerLoop.getBody());
+  for (Operation &op : *innerLoop.getBody()) {
+    if (!isa<scf::YieldOp>(&op)) {
+      Operation *clonedOp = rewriter.clone(op, mapping);
+      for (auto [oldResult, newResult] : llvm::zip(op.getResults(), clonedOp->getResults())) {
+        mapping.map(oldResult, newResult);
+      }
+    }
+  }
+
+  // Lookup the tensor.insert_slice op in the innerLoop Body
+  tensor::InsertSliceOp insertSliceOp = nullptr;
+  for (Operation &op : newInnerLoop.getBody()->getOperations()) {
+    if (auto candidate = dyn_cast<tensor::InsertSliceOp>(&op)) {
+      if (insertSliceOp)
+        return transformOp->emitError("Multiple tensor.insert_slice operations found in the innerLoop body");
+      insertSliceOp = candidate;
+    }
+  }
+  if (!insertSliceOp)
+    return transformOp->emitError("No tensor.insert_slice operation found in the innerLoop body");
+
+  Value yieldedFilter = insertSliceOp.getResult();
+  Value yieldedInput = mapping.lookup(innerLoop.getRegionIterArgs().front());
+
+  Type yieldedFilterType = yieldedFilter.getType();
+  Type yieldedInputType = yieldedInput.getType();
+
+  // Valida os tipos do filter e input antes de criar o scf.yield
+  if (!yieldedFilterType || !yieldedFilterType.isa<ShapedType>()) {
+    return transformOp->emitError("Invalid or missing FilterType in scf.yield");
+  }
+  if (!yieldedInputType || !yieldedInputType.isa<ShapedType>()) {
+    return transformOp->emitError("Invalid or missing InputType in scf.yield");
+  }
+
+  // Insere o yield com os valores do input e filter
+  rewriter.create<scf::YieldOp>(innerLoop.getLoc(), ValueRange{yieldedInput, yieldedFilter});
+
+  // Clone the outer loop's body into the new outerLoop
+  rewriter.setInsertionPointToStart(newOuterLoop.getBody());
+  for (Operation &op : *outerLoop.getBody()) {
+    if (&op != innerLoop.getOperation() && !isa<scf::YieldOp>(&op)) {
+      Operation *clonedOp = rewriter.clone(op, mapping);
+      for (auto [oldResult, newResult] : llvm::zip(op.getResults(), clonedOp->getResults())) {
+        mapping.map(oldResult, newResult);
+      }
+    }
+  }
+
+  // Add a yield operation for the new outerLoop
+  rewriter.setInsertionPointToEnd(newOuterLoop.getBody());
+  Value yieldValueOuter = newInnerLoop.getResults().front();
+  rewriter.create<scf::YieldOp>(outerLoop.getLoc(), yieldValueOuter);
+
+  llvm::errs() << "\nDump after clonning outerLoop:\n";
+  newOuterLoop.dump();
+
+  // Replace all uses of the original loops' results
+  for (auto [oldRes, newRes] : llvm::zip(innerLoop.getResults(), newInnerLoop.getResults())) {
+    oldRes.replaceAllUsesWith(newRes);
+  }
+  for (auto [oldRes, newRes] : llvm::zip(outerLoop.getResults(), newOuterLoop.getResults())) {
+    oldRes.replaceAllUsesWith(newRes);
+  }
+
+  rewriter.eraseOp(innerLoop);
+  rewriter.eraseOp(outerLoop);
+
+  // Update the uKernel to the new one in the innerLoop Body
+  tiledOps[0] = *newInnerLoop.getBody()->getOps<linalg::GenericOp>().begin();
+
+  // Update the loops
+  loopOps[0] = newOuterLoop.getOperation();
+  loopOps[1] = newInnerLoop.getOperation();
+
+  llvm::errs() << "\nDump after replacements:\n";
+  newOuterLoop.dump();
+
+  return success();
+}
+
 // Apply a tiling transformation to a modified payload ops and store both the
-/// tiled operation as well as the created tile loops.
+// tiled operation  (uKernel) as well as the created tile loops.
 static LogicalResult
 applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
-            ArrayRef<OpFoldResult> tileSizes, ArrayRef<int64_t> interchange,
+            CSA csa, CSAStrategy res, SmallVector<int64_t, 2> strides, 
             transform::TransformResults &transformResults) {
 
   SmallVector<Operation *> tiledOps;
@@ -137,19 +263,31 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   auto tilingInterfaceOp = dyn_cast<TilingInterface>(target);
   if (!tilingInterfaceOp)
     return transformOp->emitError("only TilingInterface ops are supported");
-  scf::SCFTilingOptions tilingOptions;
-  tilingOptions.setTileSizes(tileSizes).setInterchange(interchange);
-  tilingOptions.setLoopType(scf::SCFTilingOptions::LoopType::ForOp);
 
-#ifndef NDEBUG
-  DBGS() << "Outer Conv before tiling: " << tilingInterfaceOp << "\n";
-#endif // NDEBUG
+  // Assign tile sizes
+  // Input Stationary: N, NF * K2, NWIN * K3, NC, FH, FW  
+  // Weight Stationary: N, NF * K3, NWIN * K2, NC, FH, FW  
+  int64_t nFTiles = csa.mK_.num_filters * (res.schd == IS ? res.k2 : res.k3);
+  int64_t nWinTiles = csa.mK_.nwindows * (res.schd == IS ? res.k3 : res.k2);
+  SmallVector<int64_t, 6> tileSize = {1, nFTiles, nWinTiles, res.tile_c, 0, 0};
+  SmallVector<OpFoldResult> tileSizesOfr = getAsIndexOpFoldResult(rewriter.getContext(), tileSize);
+
+  // Order:
+  // Input Stationary: N, NC, NWIN, NF
+  // Weight Stationary: N, NC, NF, NWIN
+  int64_t outer = res.schd == IS ? 2 : 1;
+  int64_t inner = res.schd == IS ? 1 : 2;
+  SmallVector<int64_t, 4> tileInterchange = {0, 3, outer, inner};
+
+  scf::SCFTilingOptions tilingOptions;
+  tilingOptions.setTileSizes(tileSizesOfr).setInterchange(tileInterchange);
+  tilingOptions.setLoopType(scf::SCFTilingOptions::LoopType::ForOp);
 
   rewriter.setInsertionPoint(target);
   FailureOr<scf::SCFTilingResult> tiledResults =
       scf::tileUsingSCF(rewriter, tilingInterfaceOp, tilingOptions);
   if (failed(tiledResults))
-    return failure();
+    return transformOp->emitError("failed the outermost tile operation");
 
   // Perform the replacement of tiled and fused values.
   rewriter.replaceOp(tilingInterfaceOp, tiledResults->replacements);
@@ -157,10 +295,12 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   // Perform the tiling in the inner convolution
   auto innerOp = tiledResults->tiledOps.front();
 
-  SmallVector<int64_t, 6> innerTileSize = {0, 8, 16, 0, 0, 0};
-  SmallVector<OpFoldResult> innerTileSizesOfr =
-      getAsIndexOpFoldResult(rewriter.getContext(), innerTileSize);
-  SmallVector<int64_t, 2> innerInterchange = {1, 0};
+  SmallVector<int64_t, 6> innerTileSize = {0, csa.mK_.num_filters, csa.mK_.nwindows, 0, 0, 0};
+  SmallVector<OpFoldResult> innerTileSizesOfr = getAsIndexOpFoldResult(rewriter.getContext(), innerTileSize);
+
+  int64_t innerFOrder = res.schd == IS ? 1 : 0;
+  int64_t innerSOrder = res.schd == IS ? 0 : 1;
+  SmallVector<int64_t, 2> innerInterchange = {innerFOrder, innerSOrder};
 
   auto innerTilingInterfaceOp = dyn_cast<TilingInterface>(innerOp);
   if (!innerTilingInterfaceOp)
@@ -169,24 +309,25 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   innerTilingOptions.setTileSizes(innerTileSizesOfr).setInterchange(innerInterchange);
   innerTilingOptions.setLoopType(scf::SCFTilingOptions::LoopType::ForOp);
 
-#ifndef NDEBUG
-  DBGS() << "Inner Conv before tiling: " << innerTilingInterfaceOp << "\n";
-#endif // NDEBUG
-
   rewriter.setInsertionPoint(innerOp);
   FailureOr<scf::SCFTilingResult> innerTiledResults =
       scf::tileUsingSCF(rewriter, innerTilingInterfaceOp, innerTilingOptions);
   if (failed(innerTiledResults))
-    return failure();
+    return transformOp->emitError("failed the innermost tile operation");
 
   // Perform the replacement of tiled and fused values.
   rewriter.replaceOp(innerTilingInterfaceOp, innerTiledResults->replacements);
+
   // Report back the relevant handles to the transform op.
   tiledOps.push_back(innerTiledResults->tiledOps.front());
   for (Operation *loop : innerTiledResults->loops)
     loopOps.push_back(loop);
   for (Operation *loop : tiledResults->loops)
     loopOps.push_back(loop);
+
+  // Swap the innner loops in the case of Input Stationary
+  LogicalResult result0 = swapInductionVars(rewriter, transformOp, res, tiledOps, loopOps);
+  if (failed(result0)) return transformOp->emitError("failed to swap indvar Ops");
 
   transformResults.set(transformOp->getOpResult(0), tiledOps);
   for (auto [index, loop] : llvm::enumerate(loopOps))
@@ -195,7 +336,9 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   return success();
 }
 
-// Implementation of SConv::apply transform dialect operation.
+///
+/// Implementation of SConv::apply transform dialect operation.
+///
 DiagnosedSilenceableFailure
 transform::SConvOp::apply(transform::TransformRewriter &rewriter,
                           transform::TransformResults &results,
@@ -251,10 +394,6 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   Value reshapedOutput = rewriter.create<tensor::CollapseShapeOp>(
       loc, reshapedOutputType, output, outputReassocIndices);
 
-#ifndef NDEBUG
-  DBGS() << "Collapsed shape: " << reshapedOutput << "\n";
-#endif // NDEBUG
-
   // Create the affine maps, iterator types and output tensor shape
   auto parallel = utils::IteratorType::parallel;
   auto reduction = utils::IteratorType::reduction;
@@ -263,6 +402,7 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   // Get strides
   auto hstride = convOp.getStrides().getValues<int64_t>()[0];
   auto wstride = convOp.getStrides().getValues<int64_t>()[1];
+  SmallVector<int64_t, 2> strides = {hstride, wstride};
 
   AffineExpr d0, d1, d2, d3, d4, d5;
   bindDims(context, d0, d1, d2, d3, d4, d5);
@@ -284,43 +424,23 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
         nestedBuilder.create<linalg::YieldOp>(nestedLoc, add);
       });
 
-#ifndef NDEBUG
-  DBGS() << "GenericOp: " << genericOp << "\n";
-#endif // NDEBUG
-
-  // Create the Expanded Shape to be inserted at the end of convOp
+  // Create the Expanded Shape
   auto reshapedResult = rewriter.create<tensor::ExpandShapeOp>(loc, outputType, genericOp.getResults().front(), outputReassocIndices);
+
+  // replace convOp with (reshapedOutput + genericOp + reshapedResult)
   rewriter.replaceOp(convOp, ArrayRef<Value>{reshapedResult});
 
-#ifndef NDEBUG
-  DBGS() << "Expanded Shape: " << reshapedResult << "\n";
-#endif // NDEBUG
-
   // Call the CSA Analysis
-  // ConvInfo csaConv = {ic, oh, ow, fh, fw, oc, 4};
-  // CSA csa = createCSAPass(csaConv);
-  // CSAStrategy res = csa();
+  ConvInfo csaConv = {ic, oh, ow, fh, fw, oc, 4};
+  CSA csa = createCSAPass(csaConv);
+  CSAStrategy res = csa();
   
-  // Assign tile sizes
-  // N, NF * K2/3, NWIN * K3/2, NC, FH, FW
-  // int64_t nFTiles = csa.mK_.num_filters * (res.schd == IS ? res.k2 : res.k3);
-  // int64_t nWinTiles = csa.mK_.nwindows * (res.schd == IS ? res.k3 : res.k2);
-  // SmallVector<int64_t, 6> tileSize = {1, nFTiles, nWinTiles, res.tile_c, 0, 0};
-  SmallVector<int64_t, 6> tileSize = {1, 64, 32, 16, 0, 0};  // works for the example, only
+  /* Just for test */
+  res.schd = IS; res.k2 = 8; res.k3 = 2; res.tile_c = 16;
+  /* Comment the code above to use the CSA Analysis */
 
-  // Order:
-  // Input Stationary: N, NC, NWIN, NF
-  // Weight Stationary: N, NC, NF, NWIN
-  // int64_t nFOrder = res.schd == IS ? 3 : 2;
-  // int64_t nWinOrder = res.schd == IS ? 2 : 3;
-  // SmallVector<int64_t, 4> tileInterchange = {0, nFOrder, nWinOrder, 1};
-  SmallVector<int64_t, 4> tileInterchange = {0, 3, 2, 1}; // works for the example, only
-
-  SmallVector<OpFoldResult> tileSizesOfr =
-      getAsIndexOpFoldResult(rewriter.getContext(), tileSize);
-
-  LogicalResult result =
-     applyTileTo(rewriter, getOperation(), genericOp, tileSizesOfr, tileInterchange, results);
+  // Apply the tile in the genericOp based on the CSA Analysis
+  LogicalResult result = applyTileTo(rewriter, getOperation(), genericOp, csa, res, strides, results);
 
   return failed(result) ? DiagnosedSilenceableFailure::definiteFailure()
                         : DiagnosedSilenceableFailure::success();

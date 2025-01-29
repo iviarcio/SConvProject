@@ -5,6 +5,7 @@ add_mlir_library(
 
   # Built from the following source files.
   SConv.cpp
+  CSA.cpp
 
   # Make includes visible without top-level path.
   ADDITIONAL_HEADER_DIRS
